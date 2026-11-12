@@ -1,0 +1,413 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazil]{babel}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible, frame=single, breaklines=true}
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+
+\title{Relatório Técnico do Firmware\\BMS com ADBMS6830B e STM32G474RE}
+\author{Projeto Analog\_BMS}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%% ---------------------------------------------------------------------------
+\section{Introdução}
+Este relatório documenta o firmware do sistema de gerenciamento de bateria (BMS) do acumulador, construído em torno do monitor de células Analog Devices ADBMS6830B e de um microcontrolador STM32G474RE (Nucleo-G474RE). A arquitetura foi baseada no repositório \code{g474-bms} (branch \code{code-refactor}) da Manchester Stinger Motorsports, adaptada ao projeto.
+
+\textbf{Referências normativas e técnicas}
+\begin{itemize}[leftmargin=*]
+  \item ADBMS6830B Data Sheet, Rev.\ 0 (Analog Devices).
+  \item FSAE Rules 2026, V1.0 --- seção EV.7 (Shutdown System): EV.7.3 (BMS), EV.7.4 (tensão) e EV.7.5 (temperatura).
+  \item Documentação técnica anterior do projeto (\code{BMS_ADBMS6830_Documentacao_Tecnica.docx}).
+\end{itemize}
+
+\textbf{Funções do firmware}
+\begin{enumerate}[leftmargin=*]
+  \item Medir a tensão das 16 células do IC (S-ADC) e a temperatura interna do die (ITMP).
+  \item Comparar as tensões com os limites de sobretensão e subtensão e a temperatura com sua faixa operacional.
+  \item Detectar fio de sense aberto por injeção de corrente nos canais pares e ímpares.
+  \item Detectar falhas de comunicação (PEC, timeout do polling).
+  \item Abrir o Shutdown Circuit (SDC) e travar a falha ao detectar qualquer condição crítica.
+  \item Balancear passivamente as células pelas chaves de descarga internas do ADBMS6830B.
+  \item Montar o buffer de telemetria CAN com tensão, diferença para a célula mais baixa e estado de cada célula.
+\end{enumerate}
+
+%% ---------------------------------------------------------------------------
+\section{Arquitetura do software}
+O firmware é organizado em camadas. Cada camada só chama a camada abaixo dela.
+
+\begin{lstlisting}
+main.c  (CubeMX + USER CODE)
+  |  bms_init()  /  programLoop()
+  v
+comm.c  (aplicacao: dados, ciclo principal, balanceamento, CAN)
+  |            |                      |
+  v            v                      v
+bms_safety.c   bms_balancing.c    bms_data.h (registradores, conversoes)
+  |            |
+  v            v
+bms_generic.c  (comandos, PEC15/PEC10, SPI, polling)
+  |
+  v
+mcu_wrapper.c  (HAL: CS, SPI2, TIM2, delays, wake-up)
+\end{lstlisting}
+
+\subsection{Estrutura de diretórios}
+\begin{longtable}{@{}p{5.2cm}p{9.3cm}@{}}
+\toprule
+\textbf{Caminho} & \textbf{Conteúdo} \\
+\midrule
+\endhead
+\code{Core/Src/main.c} & Inicialização do CubeMX (clock, GPIO, SPI2, FDCAN1/2, TIM2), chamada a \code{bms_init()} e laço com \code{programLoop()} \\
+\code{Core/Inc/main.h} & Definição dos pinos (\code{BMS_CS}, \code{BMS_CS2}) \\
+\code{Core/Analog_libs/inc} & Cabeçalhos: \code{common.h}, \code{bms_cmd.h}, \code{bms_data.h}, \code{bms_generic.h}, \code{mcu_wrapper.h}, \code{communication.h}, \code{bms_safety.h}, \code{bms_balancing.h} \\
+\code{Core/Analog_libs/src} & Implementações: \code{bms_generic.c}, \code{mcu_wrapper.c}, \code{comm.c}, \code{bms_safety.c}, \code{bms_balancing.c} \\
+\code{Analog_BMS.ioc} & Projeto do CubeMX \\
+\code{Debug/} & Saída de build do STM32CubeIDE (\code{Analog_BMS.elf}) \\
+\bottomrule
+\end{longtable}
+
+%% ---------------------------------------------------------------------------
+\section{Hardware e configuração do microcontrolador}
+\subsection{Parâmetros de periféricos}
+\begin{longtable}{@{}p{3.2cm}p{11.3cm}@{}}
+\toprule
+\textbf{Periférico} & \textbf{Configuração} \\
+\midrule
+\endhead
+Clock & HSI 16~MHz, PLLM = 4, PLLN = 85, PLLR = 2 $\Rightarrow$ SYSCLK = HCLK = APB1 = APB2 = 170~MHz, regulador em Scale~1 Boost, \code{FLASH_LATENCY_4} \\
+SPI2 & Master, 2 linhas, 8 bits, MSB primeiro, CPOL = 0, CPHA = 1ª borda (modo 0), NSS por software, prescaler 128 $\Rightarrow$ 1,33~MHz \\
+CS do BMS & GPIO \code{BMS_CS} (PC0), saída \emph{push-pull}, controlado por \code{bmsCsLow()} e \code{bmsCsHigh()} \\
+Saída do SDC & GPIO \code{BMS_CS2} (PC7), nível baixo abre o SDC \\
+TIM2 & Contador de 32 bits, prescaler 169, contagem a 1~MHz (1~$\mu$s por tick) \\
+FDCAN1/FDCAN2 & Quadro clássico, modo normal, gerados pelo CubeMX \\
+UART & COM1 da BSP da Nucleo, 115200~8N1 \\
+\bottomrule
+\end{longtable}
+
+\subsection{Interface com o ADBMS6830B}
+O MCU conversa com o chip por SPI (modo 0). Os comandos têm 2 bytes de código mais 2 bytes de PEC15. Os dados de registrador têm 6 bytes mais 2 bytes de PEC10. A cadeia suporta vários ICs em \emph{daisy chain}: na escrita, o IC mais distante recebe os dados primeiro; na leitura, o IC mais próximo responde primeiro. O número de ICs é definido por \code{TOTAL_IC} (atualmente 1) e o número de células por IC por \code{TOTAL_CELL} (16).
+
+%% ---------------------------------------------------------------------------
+\section{Camada de comunicação (\code{bms_generic.c}, \code{bms_cmd.h})}
+\subsection{Tabela de comandos}
+Cada comando é um vetor de 2 bytes, com o código CC[10:0] do datasheet (Tabela~50).
+\begin{longtable}{@{}p{3.4cm}p{3.1cm}p{7.8cm}@{}}
+\toprule
+\textbf{Grupo} & \textbf{Código} & \textbf{Comandos} \\
+\midrule
+\endhead
+Configuração & \code{0x001/0x002} & \code{WRCFGA}, \code{RDCFGA} \\
+ & \code{0x024/0x026} & \code{WRCFGB}, \code{RDCFGB} \\
+Tensão (C-ADC) & \code{0x004 ... 0x00B} & \code{RDCVA}, \code{RDCVB}, \code{RDCVC}, \code{RDCVD}, \code{RDCVE}, \code{RDCVF} (\code{0x004}, \code{0x006}, \code{0x008}, \code{0x00A}, \code{0x009}, \code{0x00B}) \\
+Tensão média (A-ADC) & \code{0x044 ... 0x04B} & \code{RDACA..F} \\
+Tensão S-ADC & \code{0x003...0x00F} & \code{RDSVA..F} (\code{0x003}, \code{0x005}, \code{0x007}, \code{0x00D}, \code{0x00E}, \code{0x00F}) \\
+Tensão filtrada & \code{0x012...0x017} & \code{RDFCA..F} \\
+AUX & \code{0x019...0x01F} & \code{RDAUXA..D}, \code{RDRAXA..D} \\
+Status & \code{0x030...0x034} & \code{RDSTATA..E} \\
+PWM & \code{0x020...0x023} & \code{WRPWMA}, \code{WRPWMB}, \code{RDPWMA}, \code{RDPWMB} \\
+Limpeza & \code{0x711...0x717} & \code{CLRCELL}, \code{CLRAUX}, \code{CLRFC}, \code{CLOVUV}, \code{CLRSPIN}, \code{CLRFLAG} \\
+Polling & \code{0x718...0x71F} & \code{PLADC}, \code{PLCADC}, \code{PLSADC}, \code{PLAUX}, \code{PLAUX2} \\
+Controle & \code{0x027...0x02F} & \code{SRST}, \code{MUTE}, \code{UNMUTE}, \code{RDSID}, \code{RSTCC}, \code{SNAP}, \code{UNSNAP} \\
+\bottomrule
+\end{longtable}
+
+\subsection{Comandos de conversão}
+Os comandos \code{ADCV}, \code{ADSV} e \code{ADAX} são estruturas de bitfields (\code{adcv_t}, \code{adsv_t}, \code{adax_t}) enviadas diretamente como 2 bytes.
+\begin{longtable}{@{}p{2cm}p{12.5cm}@{}}
+\toprule
+\textbf{Comando} & \textbf{Campos} \\
+\midrule
+\endhead
+\code{ADCV} & \code{RD} (medição redundante), \code{OW[1:0]} (chaves de fio aberto: 00 off, 01 canais pares, 10 canais ímpares, 11 todos), \code{RSTF} (reinicia filtro IIR), \code{DCP} (descarga permitida durante a medição), \code{CONT} (contínuo ou \emph{single-shot}) \\
+\code{ADSV} & \code{OW[1:0]}, \code{DCP}, \code{CONT}; converte pelo S-ADC \\
+\code{ADAX} & \code{OW}, \code{PUP}, \code{CH[4:0]}; canal \code{10011} seleciona o sensor interno de temperatura (ITEMP) \\
+\bottomrule
+\end{longtable}
+Valores padrão: \code{ADCV} com campos fixos \code{res2 = 01} e \code{res1 = 11}; \code{ADSV} com \code{res2 = 01}, \code{res0 = 10}, \code{res1 = 11}; \code{ADAX} com \code{res0 = 10} e \code{res1 = 01}.
+
+\subsection{PEC (código de erro de pacote)}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{PEC15} (comandos): polinômio $x^{15}+x^{14}+x^{10}+x^{8}+x^{7}+x^{4}+x^{3}+1$, valor inicial $16$, implementado por tabela de 256 entradas (\code{Pec15_Calc}). O resultado é deslocado de 1 bit (\code{remainder * 2}).
+  \item \textbf{PEC10} (dados): polinômio $x^{10}+x^{7}+x^{3}+x^{2}+x+1$ (\code{0x8F}), valor inicial $16$ (\code{pec10_calc}). Na \textbf{leitura} (\code{rx_cmd = true}) são incluídos os 6 bits do contador de comandos; na \textbf{escrita} (\code{rx_cmd = false}) o PEC cobre só os 6 bytes de dados.
+\end{itemize}
+
+\subsection{Funções de transporte}
+\begin{longtable}{@{}p{4.2cm}p{10.3cm}@{}}
+\toprule
+\textbf{Função} & \textbf{Descrição} \\
+\midrule
+\endhead
+\code{spiSendCmd} & Envia um comando de 2 bytes mais PEC15 (4 bytes) com CS baixo \\
+\code{spiSendCLRFLAG} & Envia \code{CLRFLAG} com 6 bytes de dados e PEC15 do pacote de 8 bytes \\
+\code{spiReadData} & Envia o comando, recebe $8 \times N$ bytes (6 de dado, contador+PEC10 de cada IC), calcula o PEC10 de cada IC, devolve dados, contador de comandos e flag de erro por IC \\
+\code{spiWriteData} & Monta o pacote com comando, PEC15 e, do último ao primeiro IC, 6 bytes de dados mais PEC10 \\
+\code{bmsPollAdc} & Envia o comando de polling e lê bytes até receber \code{0xFF} (SDO em nível alto = conversão concluída). Tem timeout de \code{BMS_POLL_TIMEOUT_MS} (100~ms) e retorna \code{UINT32_MAX} em timeout ou falha de SPI; em sucesso retorna o tempo em $\mu$s medido pelo TIM2 \\
+\bottomrule
+\end{longtable}
+
+%% ---------------------------------------------------------------------------
+\section{Camada de hardware (\code{mcu_wrapper.c})}
+\begin{longtable}{@{}p{4.2cm}p{10.3cm}@{}}
+\toprule
+\textbf{Função} & \textbf{Descrição} \\
+\midrule
+\endhead
+\code{bmsCsLow/High} & Controla o pino \code{BMS_CS} (PC0) \\
+\code{startTimer/stopTimer/getTimCount} & Inicia, para (zerando o contador) e lê o TIM2 em $\mu$s \\
+\code{bmsWakeupIc} & Acorda a cadeia: para cada IC, pulso de CS de 1~ms em nível baixo e 1~ms em nível alto \\
+\code{delayUs} & Espera ativa em $\mu$s usando o TIM2 \\
+\code{delayMsActive} & Atraso em ms que pulsa o CS a cada 500~$\mu$s para manter o chip acordado \\
+\code{spiWriteBytes} & \code{HAL_SPI_Transmit} \\
+\code{spiWriteReadBytes} & Transmite 4 bytes de comando e recebe \code{size} bytes \\
+\code{spiReadBytes} & \code{HAL_SPI_Receive} \\
+\bottomrule
+\end{longtable}
+As funções SPI retornam \code{true} em caso de sucesso do HAL.
+
+%% ---------------------------------------------------------------------------
+\section{Estruturas de dados e registradores (\code{bms_data.h})}
+\subsection{Constantes de tamanho}
+\code{TX_DATA = 6} (bytes de dado por IC), \code{RX_DATA = 8} (dado mais contador e PEC), \code{CELL = 16}, \code{PWMA_REG = 12}, \code{PWMB_REG = 4}.
+
+\subsection{Configuration Register Group A (\code{ad68_cfa_t})}
+\begin{longtable}{@{}p{1.8cm}p{12.7cm}@{}}
+\toprule
+\textbf{Byte} & \textbf{Campos} \\
+\midrule
+\endhead
+0 & \code{cth[2:0]} (limiar C-ADC $\times$ S-ADC), \code{refon} (referência permanece ligada) \\
+1 & \code{flag_d[7:0]} (força flags de diagnóstico) \\
+2 & \code{owa[2:0]} (tempo de soak), \code{owrng}, \code{soakon} \\
+3 & \code{gpo1_8} (controle dos GPIOs 1--8; 1 = pull-down desligado) \\
+4 & \code{gpo9_10} \\
+5 & \code{fc[2:0]} (frequência de corte do filtro IIR), \code{comm_bk}, \code{mute_st} e \code{snap} (somente leitura) \\
+\bottomrule
+\end{longtable}
+
+\subsection{Configuration Register Group B (\code{ad68_cfb_t})}
+\begin{longtable}{@{}p{1.8cm}p{12.7cm}@{}}
+\toprule
+\textbf{Byte} & \textbf{Campos} \\
+\midrule
+\endhead
+0 & \code{vuv[7:0]} \\
+1 & \code{vuv[11:8]} (nibble baixo), \code{vov[3:0]} (nibble alto) \\
+2 & \code{vov[11:4]} \\
+3 & \code{dcto[5:0]} (timer de descarga), \code{dtrng} (0 = 1~min/bit, 1 = 16~min/bit), \code{dtmen} (monitor do timer) \\
+4 & \code{dcc[8:1]} (descarga das células 1--8) \\
+5 & \code{dcc[16:9]} (descarga das células 9--16) \\
+\bottomrule
+\end{longtable}
+
+\subsection{Registradores de PWM}
+\begin{itemize}[leftmargin=*]
+  \item \code{ad68_pwma_t}: 12 campos de 4 bits (\code{pwm1..pwm12}), um por célula 1--12, ocupando 6 bytes.
+  \item \code{ad68_pwmb_t}: \code{pwm13..pwm16} (2 bytes) mais 4 bytes reservados.
+  \item Cada valor de 4 bits seleciona o duty cycle de 0\% a 100\% em passos de 1/15, com período de PWM de 937~ms.
+\end{itemize}
+
+\subsection{Registradores de status}
+\code{ad68_sta_t} (VREF2, ITMP, VREF3), \code{ad68_stb_t} (VD, VA, VR4K) e \code{ad68_stc_t} (flags \code{CSxFLT} e flags de falha). O Status A é lido com \code{RDSTATA}: bytes 0--1 = VREF2, bytes 2--3 = ITMP.
+
+\subsection{Conversões}
+\begin{align*}
+V_{\text{célula}} &= \text{raw}\cdot 150\,\mu\text{V} + 1{,}5\ \text{V} \quad (\text{raw em } int16)\\[2pt]
+T_{\text{die}}\ [^\circ\text{C}] &= \frac{\text{raw}\cdot 150\,\mu\text{V} + 1{,}5\ \text{V}}{7{,}5\ \text{mV}/^\circ\text{C}} - 273{,}15\\[2pt]
+\text{código}_{VOV/VUV} &= \left\lfloor \frac{V - 1{,}5}{16 \cdot 150\,\mu\text{V}} \right\rfloor \quad (12\ \text{bits})
+\end{align*}
+Para os limites configurados: VOV = 4,20~V $\Rightarrow$ código 1125; VUV = 2,50~V $\Rightarrow$ código 416.
+
+%% ---------------------------------------------------------------------------
+\section{Camada de aplicação (\code{comm.c})}
+\subsection{Estado global}
+A estrutura \code{adbms68_t} (instância estática \code{bms}) agrupa:
+\begin{itemize}[leftmargin=*]
+  \item Registradores a enviar e lidos: \code{cfa_Tx/Rx}, \code{cfb_Tx/Rx}, \code{pwma}, \code{pwmb}.
+  \item Tensões \code{volt_cell[tipo][IC][célula]} para cinco tipos (\code{VOLTAGE_C}, \code{VOLTAGE_C_AVG}, \code{VOLTAGE_C_FIL}, \code{VOLTAGE_S}, \code{VOLTAGE_TEMP}), além de soma, média, mínimo, máximo, delta e diferença para o mínimo.
+  \item Temperatura do die \code{temp_ic[IC]}.
+  \item Máscaras \code{isDischarging} e \code{isCellFaultDetect} por IC.
+\end{itemize}
+Outras variáveis estáticas: buffers SPI \code{txData}, \code{rxData}, \code{rxPecErr}, \code{rxCmdCnt}; \code{g_statusFlags}; \code{g_balancingEnabled}; \code{g_balState}; \code{g_safetyState}; \code{g_balDelta} (padrão 10~mV). O tipo de tensão usado nas decisões é \code{DISCHARGE_VOLT_TYPE = VOLTAGE_S}.
+
+\subsection{Inicialização (\code{bms_init})}
+\begin{enumerate}[leftmargin=*]
+  \item Zera as estruturas e aplica \code{resetConfig()}: CFGA padrão \code{01 00 00 FF 03 00} (CTH = 001, GPIOs com pull-down desligado, sem soak) e CFGB zerada.
+  \item CFGA: \code{refon = 1}, \code{fc = 1} (filtro IIR de 110~Hz).
+  \item CFGB: VOV e VUV a partir de \code{BMS_OV_THRESHOLD_V} e \code{BMS_UV_THRESHOLD_V}; \code{dcto = 0}, \code{dtrng = 0}, \code{dtmen = 0}.
+  \item Acorda a cadeia, lê o \code{RDSID} para validar a comunicação (PEC) e escreve CFGA e CFGB.
+  \item Inicia o C-ADC em modo contínuo (\code{ADCV}: \code{CONT = 1}, \code{DCP = 0}, \code{RSTF = 1}) e aguarda 12~ms para o filtro encher.
+\end{enumerate}
+
+\subsection{Funções de leitura}
+\begin{longtable}{@{}p{4.4cm}p{10.1cm}@{}}
+\toprule
+\textbf{Função} & \textbf{Descrição} \\
+\midrule
+\endhead
+\code{readCellVoltage(tipo)} & Lê os 6 grupos de registradores (3 células cada; o último tem 1) do tipo pedido, verifica o PEC de cada leitura, converte para volts e atualiza as estatísticas \\
+\code{calculateStats} & Soma, média, mínimo, máximo, delta (máx $-$ mín) e diferença de cada célula para o mínimo do IC \\
+\code{auxMeasurement} & \code{ADAX} no canal ITEMP, polling com \code{PLAUX}, \code{RDSTATA} e conversão do ITMP em $^\circ$C \\
+\code{balancingMeasurementVoltage} & \code{ADSV} \emph{single-shot} (\code{DCP = 0}), polling com \code{PLSADC} e leitura do S-ADC \\
+\code{readRegister} & Leitura de CFGA, CFGB, PWMA, PWMB ou SID (depuração) \\
+\code{bms_getVoltPtr} & Acesso à matriz de tensões de um tipo, usado pela rotina de fio aberto \\
+\code{bms_reset} & Para a descarga, envia \code{SRST}, aguarda 10~ms e reinicializa \\
+\bottomrule
+\end{longtable}
+
+\subsection{Ciclo principal (\code{programLoop})}
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Tensão:} \code{bmsWakeupIc}, \code{balancingMeasurementVoltage}. Falha de comunicação chama \code{commsFailure()}.
+  \item \textbf{Verificação de tensão:} \code{checkVoltage()}. Em falha, \code{stopDischarge()} e \code{bms_safety_trigger_shutdown()}.
+  \item \textbf{Temperatura:} \code{auxMeasurement()} e \code{checkTemp()} (temperatura do die). Mesma ação em falha.
+  \item \textbf{Fio aberto:} a cada 5000~ms (\code{OW_CHECK_INTERVAL_MS}) executa \code{bms_safety_task(..., check_ow = true, ...)}.
+  \item \textbf{Balanceamento:} se \code{g_balancingEnabled} e \code{fault_mask == BMS_FAULT_NONE}, chama \code{startBalancing(g_balDelta)}; se há falha ativa, chama \code{stopDischarge()}.
+\end{enumerate}
+\code{commsFailure()} para a descarga, marca \code{BMS_FAULT_COMMS} em \code{fault_mask}, abre o SDC e acumula o código em \code{g_statusFlags}.
+
+\subsection{Controle de balanceamento}
+\code{BMS_EnableBalancing(bool)} e \code{BMS_ToggleBalancing()} habilitam o balanceamento. \code{startDischarge(delta_v)} executa \code{bms_balancing_task} sobre o S-ADC e atualiza a máscara \code{isDischarging}; \code{stopDischarge()} zera DCC, PWM e DCTO. \code{startBalancing(delta_v)} chama \code{startDischarge(delta_v)}.
+
+\subsection{Telemetria CAN (\code{BMS_GetCanData})}
+Monta um frame CAN clássico estendido por célula, com ID $=$ \code{0xB000} $+\ (\text{IC}\cdot 16 + \text{célula})$ e 8 bytes:
+\begin{center}
+\begin{tabular}{@{}cll@{}}
+\toprule
+\textbf{Bytes} & \textbf{Conteúdo} & \textbf{Formato} \\
+\midrule
+0--1 & Tensão da célula & \code{int16}, mV, little-endian \\
+2--3 & Diferença para a célula mais baixa & \code{int16}, mV \\
+4--5 & Temperatura & \code{int16} (campo reservado ao TMS) \\
+6 & Flags & bit 0 = em descarga, bit 1 = falha de célula \\
+7 & Reservado & 0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+O buffer \code{canTxBuf} tem \code{TOTAL_IC * TOTAL_CELL + TOTAL_IC + 4} posições.
+
+%% ---------------------------------------------------------------------------
+\section{Módulo de segurança (\code{bms_safety.c})}
+\subsection{Estado e códigos de falha}
+\code{bms_safety_state_t} guarda \code{fault_mask}, os mapas \code{ov_cell}, \code{uv_cell}, \code{ow_cell}, \code{die_ot} e \code{temp_die}.
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Máscara} & \textbf{Valor} & \textbf{Significado} \\
+\midrule
+\code{BMS_FAULT_OV} & \code{0x01} & Sobretensão \\
+\code{BMS_FAULT_UV} & \code{0x02} & Subtensão \\
+\code{BMS_FAULT_DIE_OVERTEMP} & \code{0x04} & Temperatura do die fora da faixa \\
+\code{BMS_FAULT_OPEN_WIRE} & \code{0x08} & Fio de sense aberto \\
+\code{BMS_FAULT_COMMS} & \code{0x10} & Falha de comunicação \\
+\bottomrule
+\end{tabular}
+\end{center}
+Os códigos de retorno (\code{BMS_StatusTypeDef}) são \code{BMS_OK}, \code{BMS_ERR_COMMS}, \code{BMS_ERR_VOLTAGE}, \code{BMS_ERR_TEMP}, \code{BMS_ERR_CURRENT} e \code{BMS_ERR_OPEN_WIRE}.
+
+\subsection{Verificações}
+\begin{longtable}{@{}p{5.2cm}p{9.3cm}@{}}
+\toprule
+\textbf{Função} & \textbf{Critério} \\
+\midrule
+\endhead
+\code{bms_safety_check_voltage} & Para cada célula: $V > 4{,}20$~V marca sobretensão; $V < 2{,}50$~V marca subtensão \\
+\code{bms_safety_check_die_temperature} & $T_{\text{die}} > 125\,^{\circ}$C ou $< -40\,^{\circ}$C marca sobretemperatura do die \\
+\code{bms_safety_check_open_wire} & Compara cada canal com a referência: se a leitura com a chave de OW ligada cai mais que \code{BMS_OW_DROP_MAX_FRAC} (0,5) da tensão de referência, marca fio aberto. O canal de número par usa a passada de canais pares; o ímpar, a de canais ímpares \\
+\code{bms_safety_check_hw_flags} & Lê \code{RDSTATC} (flags \code{CSxFLT}, bytes 0--1) e \code{RDSTATD} (flags de OV/UV por célula, bytes 0--3) \\
+\code{bms_safety_task} & Executa as verificações, o ciclo de fio aberto (opcional) e aciona o desligamento \\
+\code{bms_safety_trigger_shutdown} & Coloca \code{BMS_CS2} (PC7) em nível baixo, abrindo o SDC \\
+\code{bms_safety_clear_faults} & Zera \code{fault_mask} e os mapas de falha \\
+\bottomrule
+\end{longtable}
+
+\subsection{Ciclo de detecção de fio aberto}
+\begin{enumerate}[leftmargin=*]
+  \item \code{MUTE}: desabilita a descarga para não interferir na medição.
+  \item Para \code{OW} = 0 (referência), 1 (canais pares ligados) e 2 (canais ímpares ligados): \code{ADCV} \emph{single-shot}, polling com \code{PLCADC}, \code{readCellVoltage(VOLTAGE_C)} e cópia do resultado.
+  \item \code{UNMUTE} e restauração do C-ADC contínuo (\code{OW = 0}, \code{CONT = 1}).
+  \item Falha de polling ou de PEC marca \code{BMS_FAULT_COMMS}; caso contrário aplica o critério de queda relativa.
+\end{enumerate}
+O princípio segue o datasheet: com a chave ligada, um canal íntegro lê uma fração da tensão normal (cerca de 10/12 no C-ADC, 9/10 no S-ADC); com o fio aberto, o capacitor de entrada se descarrega e a leitura cai para cerca de zero. Chaves de canais vizinhos nunca são ativadas ao mesmo tempo.
+
+\subsection{Desligamento e travamento}
+Ao detectar falha, o módulo abre o SDC pelo GPIO (\code{GPIO_PIN_RESET}). As falhas ficam registradas em \code{fault_mask} até o reset do MCU; \code{bms_init()} limpa o estado. Enquanto \code{fault_mask} for diferente de zero, o balanceamento não é executado.
+
+%% ---------------------------------------------------------------------------
+\section{Módulo de balanceamento (\code{bms_balancing.c})}
+\subsection{Estratégia}
+Balanceamento passivo \emph{bottom}: toda célula acima do mínimo global mais o limiar é descarregada pela chave interna do ADBMS6830B (corrente de pico de 300~mA), até que a diferença caia abaixo do limiar.
+
+\subsection{Algoritmo}
+\begin{enumerate}[leftmargin=*]
+  \item \code{bms_balancing_compute_stats}: mínimo, máximo, média e delta globais, e mínimo e máximo por IC.
+  \item \code{bms_balancing_update}: se $\Delta V = V_{\max}-V_{\min} \le \delta$ (padrão 10~mV), cadeia balanceada e nenhuma célula ativa. Caso contrário, \code{cell_active} é verdadeiro para as células com $V > V_{\min}+\delta$.
+  \item \code{bms_balancing_apply}, por IC:
+  \begin{itemize}
+    \item Conta as células ativas $n$ (mínimo 1) e calcula o duty de PWM $= \min(15,\ \lfloor 7\cdot 16 / n \rfloor)$.
+    \item Monta a máscara DCC de 16 bits e atribui o duty às células ativas (0 nas demais).
+    \item Atualiza a CFGB: \code{dcc1_8}, \code{dcc9_16}, \code{dcto = BAL_DCTO_MIN} (1~min), \code{dtrng = 0}, \code{dtmen = 0}.
+    \item Escreve \code{WRCFGB}, \code{WRPWMA} e \code{WRPWMB} para toda a cadeia.
+  \end{itemize}
+  \item \code{bms_balancing_stop_all}: zera DCC, \code{dcto}, \code{dtmen} e todos os PWM, e escreve os três registradores.
+  \item \code{bms_balancing_task}: encadeia \code{update} $\rightarrow$ \code{apply} (ou \code{stop_all} se balanceado) e retorna se ainda há células a descarregar.
+\end{enumerate}
+
+\subsection{Proteções de hardware do chip}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{DCTO:} timer de descarga de 1~min, reiniciado a cada escrita da CFGB.
+  \item \textbf{Watchdog de 2~s:} sem comandos válidos, o chip zera os bits DCC (e entra em estado de balanceamento estendido se DCTO $\ne 0$).
+  \item \textbf{Mute:} \code{MUTE} desliga todas as chaves de descarga em até 65~$\mu$s.
+  \item \textbf{Thermal shutdown:} acima de cerca de 150~$^\circ$C o chip desliga todas as chaves de descarga.
+\end{itemize}
+
+\subsection{Funções auxiliares}
+\code{bms_balancing_set_pwm_cell} e \code{bms_balancing_set_pwm_ic} ajustam o duty de uma célula ou de todo o IC; \code{bms_encode_vuv} e \code{bms_encode_vov} codificam as tensões em 12 bits para a CFGB.
+
+%% ---------------------------------------------------------------------------
+\section{Parâmetros configuráveis}
+\begin{longtable}{@{}p{5.8cm}p{2.4cm}p{6.3cm}@{}}
+\toprule
+\textbf{Constante} & \textbf{Valor} & \textbf{Uso} \\
+\midrule
+\endhead
+\code{TOTAL_IC} & 1 & ICs na cadeia \\
+\code{TOTAL_CELL} & 16 & Células por IC \\
+\code{BMS_OV_THRESHOLD_V} & 4,20~V & Limite de sobretensão (software e CFGB) \\
+\code{BMS_UV_THRESHOLD_V} & 2,50~V & Limite de subtensão (software e CFGB) \\
+\code{BMS_DIE_TEMP_MAX_C} & 125~$^\circ$C & Limite superior do die \\
+\code{BMS_DIE_TEMP_MIN_C} & $-40$~$^\circ$C & Limite inferior do die \\
+\code{BMS_OW_DROP_MAX_FRAC} & 0,5 & Queda máxima tolerada no teste de fio aberto \\
+\code{BAL_DELTA_DEFAULT_V} & 10~mV & Diferença mínima para iniciar a descarga \\
+\code{BAL_DCTO_MIN} & 1~min & Timer de descarga do chip \\
+\code{BAL_PWM_DUTY_DEFAULT} & \code{0x0F} & Duty de 100\% (referência) \\
+\code{BAL_MAX_CONCURRENT} & 8 & Máximo de células simultâneas (definido no cabeçalho) \\
+\code{BMS_POLL_TIMEOUT_MS} & 100~ms & Timeout do polling de ADC \\
+\code{OW_CHECK_INTERVAL_MS} & 5000~ms & Período do teste de fio aberto \\
+\code{BASE_CAN_ID} & \code{0xB000} & ID base da telemetria \\
+\bottomrule
+\end{longtable}
+
+%% ---------------------------------------------------------------------------
+\section{Compilação}
+O projeto compila no STM32CubeIDE com o makefile gerado em \code{Debug/}, usando \code{arm-none-eabi-gcc} (Cortex-M4, FPU \code{fpv4-sp-d16}, \code{-mfloat-abi=hard}, \code{-std=gnu11}, \code{-Wall}). O resultado é \code{Analog_BMS.elf}, com aproximadamente 29,7~KB de código, 308~bytes de dados inicializados e 3,5~KB de BSS.
+
+%% ---------------------------------------------------------------------------
+\section{Validação planejada}
+Roteiro de testes de bancada: sinal SPI no osciloscópio; leitura do ID e de CFGA/CFGB; precisão das tensões; leitura do ITMP; sobretensão e subtensão com medição de latência até a abertura do SDC; fio aberto; perda de comunicação; balanceamento; comportamento do watchdog e do DCTO; tempo do laço principal e dos atrasos.
+
+\end{document}
